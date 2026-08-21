@@ -1681,14 +1681,17 @@ function buildUpsertStatement({ table, columns, rows, conflict, updateColumns })
   let sql;
   if (updateColumns && updateColumns.length) {
     const setClause = updateColumns.map((c) => `"${c}" = EXCLUDED."${c}"`).join(", ");
-    // updated_at reflects the last time the row was refreshed from Tally
-    // (all synced tables define updated_at TIMESTAMPTZ DEFAULT NOW()).
+    // updated_at reflects the last time the row was refreshed from Tally.
+    // Only touched when the table actually manages that column — older
+    // databases may not have it on every table (e.g. bills created before
+    // the column existed), and referencing it there would fail every upsert.
     // RETURNING (xmax = 0) is a read-only marker that lets us distinguish rows
     // actually INSERTED by this statement (xmax = 0) from rows that already
     // existed and were only UPDATED (xmax <> 0). No database behavior change.
+    const touchTimestamp = columns.includes("updated_at") || updateColumns.includes("updated_at");
     sql = `INSERT INTO "${table}" (${columns.map((c) => `"${c}"`).join(", ")})
            VALUES ${placeholders}
-           ON CONFLICT ${conflictTarget} DO UPDATE SET ${setClause}, "updated_at" = NOW()
+           ON CONFLICT ${conflictTarget} DO UPDATE SET ${setClause}${touchTimestamp ? ', "updated_at" = NOW()' : ""}
            RETURNING (xmax = 0) AS "_is_insert"`;
   } else {
     sql = `INSERT INTO "${table}" (${columns.map((c) => `"${c}"`).join(", ")})
@@ -1901,8 +1904,15 @@ CREATE TABLE IF NOT EXISTS bills (
   overdue_days   INT DEFAULT 0,
   bill_type      TEXT,
   source_hash    TEXT NOT NULL,
+  updated_at     TIMESTAMPTZ DEFAULT NOW(),
   UNIQUE (company_guid, source_hash)
 );
+-- Migration: bills tables created before updated_at existed must be upgraded,
+-- otherwise every bill upsert on an existing row fails.
+DO $$ BEGIN
+  ALTER TABLE bills ADD COLUMN updated_at TIMESTAMPTZ DEFAULT NOW();
+EXCEPTION WHEN duplicate_column THEN NULL;
+END $$;
 
 CREATE TABLE IF NOT EXISTS inventory_items (
   company_guid   TEXT NOT NULL,
