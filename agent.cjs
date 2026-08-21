@@ -52,6 +52,61 @@ function devLog(...args) {
 }
 
 // ============================================================
+//  LIVE PROGRESS — one terminal line, refreshed in place with \r
+//  e.g.  "Fetching Vouchers... 500 done" -> "... 1000 done"
+//  Normal mode only: Developer Mode keeps the full technical log
+//  output (an inline line would collide with streaming logs).
+//  Counts are real processed-record counts reported by the sync
+//  flow itself — never estimated.
+// ============================================================
+const PROGRESS = { label: null, lastDrawn: -1 };
+
+function progressSupported() {
+  return !isDeveloperMode && process.stdout && process.stdout.isTTY;
+}
+
+function progressStart(label) {
+  if (!progressSupported()) return;
+  PROGRESS.label = label;
+  PROGRESS.lastDrawn = -1;
+  process.stdout.write(`${label}... 0 done`);
+}
+
+function progressUpdate(count) {
+  if (!PROGRESS.label) return;
+  const n = Number(count) || 0;
+  if (n === PROGRESS.lastDrawn) return;
+  PROGRESS.lastDrawn = n;
+  // \r returns the cursor to the start of the same line so the previous
+  // text is overwritten instead of printing thousands of new lines.
+  process.stdout.write(`\r${PROGRESS.label}... ${n.toLocaleString()} done`);
+}
+
+// Finishes the inline line (newline) and reports completion.
+function progressEnd(finalCount, entityLabel) {
+  const hadLine = !!PROGRESS.label;
+  const n = Number(finalCount) || 0;
+  if (hadLine) {
+    const label = PROGRESS.label;
+    PROGRESS.label = null;
+    process.stdout.write(`\r${label}... ${n.toLocaleString()} done\n`);
+  }
+  if (entityLabel && !isDeveloperMode) {
+    console.log(`✅ ${entityLabel} sync completed`);
+  }
+}
+
+// Terminates the current inline line WITHOUT ending progress, so warning
+// or error messages print on their own clean line; the counter redraws
+// automatically on the next update.
+function progressBreak() {
+  if (PROGRESS.label && PROGRESS.lastDrawn >= 0) {
+    process.stdout.write("\n");
+    PROGRESS.lastDrawn = -1;
+  }
+}
+
+// ============================================================
 //  HTTP AGENTS (Tally + long XML responses)
 // ============================================================
 // Timeouts are DISABLED by default so long Tally streams are never killed
@@ -2120,6 +2175,7 @@ async function detectCompanies() {
 // ============================================================
 async function syncLedgers(company) {
   const t0 = Date.now();
+  progressStart("Fetching Ledgers");
 
   const xmlRequest = `
 <ENVELOPE>
@@ -2172,6 +2228,7 @@ async function syncLedgers(company) {
   const ledgerArray = Array.isArray(ledgers) ? ledgers : [ledgers];
 
   devLog("Ledgers from Tally:", ledgerArray.length);
+  progressUpdate(ledgerArray.length);
 
   const ledgerRows = [];
   const ledgerGuids = [];
@@ -2294,6 +2351,7 @@ async function syncLedgers(company) {
 
   await cleanupByGuids("ledgers", company.company_guid, "ledger_guid", ledgerGuids);
   await logSync("ledgers", result.synced);
+  progressEnd(ledgerRows.length, "Ledgers");
 
   const ledgerChecksum = computeGuidChecksum(ledgerGuids);
   const prevLedgerState = await getSyncState(ACTIVE_COMPANY_GUID, "ledgers");
@@ -2347,6 +2405,15 @@ async function syncVouchers(company, opts = {}) {
   // outputs are written to the database. Defaults keep old callers syncing both.
   const saveVouchers = opts.saveVouchers !== false;
   const saveInvoices = opts.saveInvoices !== false;
+
+  // Live single-line progress for the shared Voucher Register fetch.
+  const voucherProgressLabel =
+    saveVouchers && saveInvoices
+      ? "Fetching Vouchers & Invoices"
+      : saveVouchers
+      ? "Fetching Vouchers"
+      : "Fetching Invoices";
+  progressStart(voucherProgressLabel);
 
   // Smaller windows = smaller Tally responses = each window finishes fast and
   // checkpoints stay fine-grained on huge companies. Overridable via
@@ -2699,6 +2766,8 @@ async function syncVouchers(company, opts = {}) {
         await writeChunk(batch);
         windowGuids.push(...batch.chunkGuids);
       }
+      // Live progress: unique vouchers successfully fetched + persisted so far
+      progressUpdate(countedGuids.size);
     };
 
     const { bytes } = await fetchVouchersStream(xmlRequest, null, {
@@ -2754,6 +2823,7 @@ async function syncVouchers(company, opts = {}) {
       structuredLog("warn", `[vouchers] WINDOW FAILED (non-fatal): ${chunk.fromDate}-${chunk.toDate}`, {
         error: windowErr.message
       });
+      progressBreak();
       if (isDeveloperMode) {
         console.log(`⚠️  Window ${chunk.label} failed: ${windowErr.message} — continuing...`);
       } else {
@@ -2763,6 +2833,15 @@ async function syncVouchers(company, opts = {}) {
     }
     if (i < chunks.length - 1) await sleep(800);
   }
+
+  progressEnd(
+    countedGuids.size,
+    saveVouchers && saveInvoices
+      ? "Vouchers & Invoices"
+      : saveVouchers
+      ? "Vouchers"
+      : "Invoices"
+  );
 
   structuredLog("info", `[vouchers] VALIDATE: ${totalFetched} fetched, ${skipped} skipped, ${processed} windows processed, ${resumed} windows resumed from checkpoint, ${reFetchedRecent} recent windows re-fetched`);
 
@@ -2907,7 +2986,7 @@ async function syncBillsForType(billType, company) {
   const reportName = billType === "PAYABLE" ? "Bills Payable" : "Bills Receivable";
   const entity = billType === "PAYABLE" ? "bills_payable" : "bills_receivable";
 
-  console.log(`🧾 Syncing ${reportName}...`);
+  progressStart(`Fetching ${reportName}`);
 
   const syncStartYear = resolveSyncStartYear(company);
   let billsFrom = `${syncStartYear}-04-01`;
@@ -3077,12 +3156,14 @@ async function syncBillsForType(billType, company) {
     saveBillSyncState(billType, window.label, syncStartYear);
 
     structuredLog("info", `[${entity}] WINDOW DONE: ${window.fromDate}-${window.toDate} fetched=${records.length} valid=${rows.length} skipped=${windowSkipped} size=${fmtBytes(bytes)}`);
+    progressUpdate(totalFetched);
     processed++;
 
     if (i < windows.length - 1) await sleep(800);
   }
 
   await logSync(entity, totalSaved);
+  progressEnd(totalFetched, reportName);
 
   recordEntityStats(entity, {
     fetched: totalFetched,
@@ -3115,6 +3196,7 @@ async function syncBillsForType(billType, company) {
 async function syncOrders() {
   if (!ACTIVE_COMPANY_GUID) return;
   const t0 = Date.now();
+  progressStart("Fetching Orders");
 
   const xml = `
 <ENVELOPE>
@@ -3172,6 +3254,7 @@ async function syncOrders() {
   const voucherArray = Array.isArray(vouchers) ? vouchers : [vouchers];
 
   devLog("📦 Orders Found:", voucherArray.length);
+  progressUpdate(voucherArray.length);
 
   const rows = [];
   const orderGuids = [];
@@ -3229,6 +3312,7 @@ async function syncOrders() {
 
   await cleanupByGuids("orders", ACTIVE_COMPANY_GUID, "order_guid", orderGuids);
   await logSync("orders", result.synced);
+  progressEnd(rows.length, "Orders");
 
   const orderChecksum = computeGuidChecksum(orderGuids);
   const prevOrderState = await getSyncState(ACTIVE_COMPANY_GUID, "orders");
@@ -3264,6 +3348,7 @@ async function syncOrders() {
 async function fetchFullStockData() {
   if (!ACTIVE_COMPANY_GUID) return;
   const t0 = Date.now();
+  progressStart("Fetching Inventory Items");
 
   const xml = `
 <ENVELOPE>
@@ -3311,6 +3396,7 @@ async function fetchFullStockData() {
   const itemArray = Array.isArray(items) ? items : [items];
 
   devLog("📦 Stock items from Tally:", itemArray.length);
+  progressUpdate(itemArray.length);
 
   const rows = [];
   const itemGuids = [];
@@ -3379,6 +3465,7 @@ async function fetchFullStockData() {
 
   await cleanupByGuids("inventory_items", ACTIVE_COMPANY_GUID, "item_guid", itemGuids);
   await logSync("inventory_items", result.synced);
+  progressEnd(rows.length, "Inventory Items");
 
   const invChecksum = computeGuidChecksum(itemGuids);
   const prevInvState = await getSyncState(ACTIVE_COMPANY_GUID, "inventory_items");
@@ -3468,7 +3555,6 @@ async function syncAllData(companies, dataTypes = "all") {
 
       if (wants("ledgers")) {
         devLog("➡️ syncLedgers");
-        console.log("Fetching Ledgers...");
         await syncLedgers(company);
       }
 
@@ -3486,8 +3572,6 @@ async function syncAllData(companies, dataTypes = "all") {
       // run it once whenever either is selected and save only what was chosen.
       if (wants("vouchers") || wants("invoices")) {
         devLog("➡️ syncVouchers");
-        if (wants("vouchers")) console.log("Fetching Vouchers...");
-        if (wants("invoices")) console.log("Fetching Invoices...");
         await syncVouchers(company, {
           saveVouchers: wants("vouchers"),
           saveInvoices: wants("invoices")
@@ -3496,13 +3580,11 @@ async function syncAllData(companies, dataTypes = "all") {
 
       if (wants("orders")) {
         devLog("➡️ syncOrders");
-        console.log("Fetching Orders...");
         await syncOrders();
       }
 
       if (wants("inventory_items")) {
         devLog("➡️ fetchFullStockData");
-        console.log("Fetching Inventory Items...");
         await fetchFullStockData();
       }
 
