@@ -729,7 +729,7 @@ function askQuestion(query, hideInput = false) {
     output: process.stdout
   });
 
-  if (hideInput) {
+  if (hideInput && process.stdin.isTTY && typeof process.stdin.setRawMode === "function") {
     process.stdout.write(query);
     process.stdin.setRawMode(true);
     let input = "";
