@@ -1648,12 +1648,14 @@ function buildUpsertStatement({ table, columns, rows, conflict, updateColumns })
   let sql;
   if (updateColumns && updateColumns.length) {
     const setClause = updateColumns.map((c) => `"${c}" = EXCLUDED."${c}"`).join(", ");
+    // updated_at reflects the last time the row was refreshed from Tally
+    // (all synced tables define updated_at TIMESTAMPTZ DEFAULT NOW()).
     // RETURNING (xmax = 0) is a read-only marker that lets us distinguish rows
     // actually INSERTED by this statement (xmax = 0) from rows that already
     // existed and were only UPDATED (xmax <> 0). No database behavior change.
     sql = `INSERT INTO "${table}" (${columns.map((c) => `"${c}"`).join(", ")})
            VALUES ${placeholders}
-           ON CONFLICT ${conflictTarget} DO UPDATE SET ${setClause}
+           ON CONFLICT ${conflictTarget} DO UPDATE SET ${setClause}, "updated_at" = NOW()
            RETURNING (xmax = 0) AS "_is_insert"`;
   } else {
     sql = `INSERT INTO "${table}" (${columns.map((c) => `"${c}"`).join(", ")})
