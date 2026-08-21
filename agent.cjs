@@ -1085,6 +1085,43 @@ function entityLabel(entityKey) {
   return found ? found.label : entityKey;
 }
 
+// Voucher types Tally Prime keeps OUT of its regular voucher totals —
+// they are shown separately under Order Books in the UI. The middleware
+// stores them like any other voucher (no data loss), but the summary TOTAL
+// mirrors what the user sees in Tally Prime so the numbers reconcile.
+const ORDER_VOUCHER_TYPES = new Set(["sales order", "purchase order"]);
+
+function isOrderVoucherType(type) {
+  return ORDER_VOUCHER_TYPES.has(String(type || "").trim().toLowerCase());
+}
+
+// rows: [{ type, active, cancelled, total? }]
+function printVoucherTypeBreakdown(rows) {
+  if (!rows || !rows.length) return;
+  console.log("");
+  console.log("Voucher Type Breakdown (Active / Cancelled / Total):");
+  let accActive = 0, accCancelled = 0, ordActive = 0, ordCancelled = 0;
+  for (const r of rows) {
+    const total = r.total ?? r.active + r.cancelled;
+    console.log(`  • ${r.type}: ${r.active.toLocaleString()} / ${r.cancelled.toLocaleString()} / ${total.toLocaleString()}`);
+    if (isOrderVoucherType(r.type)) {
+      ordActive += r.active;
+      ordCancelled += r.cancelled;
+    } else {
+      accActive += r.active;
+      accCancelled += r.cancelled;
+    }
+  }
+  const accTotal = accActive + accCancelled;
+  const ordTotal = ordActive + ordCancelled;
+  console.log(`  ── TOTAL: ${accActive.toLocaleString()} / ${accCancelled.toLocaleString()} / ${accTotal.toLocaleString()}`);
+  if (ordTotal > 0) {
+    console.log(
+      `  ℹ️ Plus ${ordTotal.toLocaleString()} order voucher(s) (Sales Order/Purchase Order). Tally Prime shows these under Order Books, so they are not part of its voucher total.`
+    );
+  }
+}
+
 async function printSyncSummary(syncStart) {
   const dur = Date.now() - syncStart;
   structuredLog("info", "Sync summary", {
@@ -1185,26 +1222,14 @@ async function printSyncSummary(syncStart) {
         );
 
         if (dbRows.length > 0) {
-          console.log("");
-          console.log("Voucher Type Breakdown (Active / Cancelled / Total):");
-          let gA = 0, gC = 0, gT = 0;
-          for (const r of dbRows) {
-            gA += r.active; gC += r.cancelled; gT += r.active + r.cancelled;
-            console.log(
-              `  • ${r.voucher_type}: ${r.active.toLocaleString()} / ${r.cancelled.toLocaleString()} / ${(r.active + r.cancelled).toLocaleString()}`
-            );
-          }
-          console.log(`  ── TOTAL: ${gA.toLocaleString()} / ${gC.toLocaleString()} / ${gT.toLocaleString()}`);
+          printVoucherTypeBreakdown(dbRows.map((r) => ({
+            type: r.voucher_type,
+            active: r.active,
+            cancelled: r.cancelled
+          })));
         } else if (cs.voucherTypeBreakdown && cs.voucherTypeBreakdown.length > 0) {
           // Fallback: last-known breakdown captured during this cycle.
-          console.log("");
-          console.log("Voucher Type Breakdown (Active / Cancelled / Total):");
-          let gA = 0, gC = 0, gT = 0;
-          for (const r of cs.voucherTypeBreakdown) {
-            gA += r.active; gC += r.cancelled; gT += r.total;
-            console.log(`  • ${r.type}: ${r.active.toLocaleString()} / ${r.cancelled.toLocaleString()} / ${r.total.toLocaleString()}`);
-          }
-          console.log(`  ── TOTAL: ${gA.toLocaleString()} / ${gC.toLocaleString()} / ${gT.toLocaleString()}`);
+          printVoucherTypeBreakdown(cs.voucherTypeBreakdown);
         }
       }
     } catch (e) {}
@@ -2888,20 +2913,7 @@ async function syncVouchers(company, opts = {}) {
   typeArr.sort((a, b) => b.total - a.total);
 
   if (allTypes.size > 0 && isDeveloperMode) {
-    console.log("");
-    console.log("Voucher Type Breakdown (Active / Cancelled / Total):");
-    let grandActive = 0, grandCancelled = 0, grandTotal = 0;
-    for (const r of typeArr) {
-      console.log(
-        `  • ${r.type}: ${r.active.toLocaleString()} / ${r.cancelled.toLocaleString()} / ${r.total.toLocaleString()}`
-      );
-      grandActive += r.active;
-      grandCancelled += r.cancelled;
-      grandTotal += r.total;
-    }
-    console.log(
-      `  ── TOTAL: ${grandActive.toLocaleString()} / ${grandCancelled.toLocaleString()} / ${grandTotal.toLocaleString()}`
-    );
+    printVoucherTypeBreakdown(typeArr);
     console.log("");
   }
 
