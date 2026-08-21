@@ -1085,6 +1085,15 @@ function entityLabel(entityKey) {
   return found ? found.label : entityKey;
 }
 
+// Builds the explanatory note for unconfirmed draft vouchers excluded from
+// the breakdown total (optional / post-dated). Tally Prime hides these from
+// its Day Book/Statistics screens too, so excluding them keeps the TOTAL
+// reconciled with what the user sees in Tally.
+function draftNote(count) {
+  if (!count || count <= 0) return null;
+  return `Excluded ${count.toLocaleString()} unconfirmed draft voucher(s) (optional/post-dated). Tally Prime also does not count these until confirmed. They are still stored in the database.`;
+}
+
 // rows: [{ type, active, cancelled, total? }] — TOTAL always includes every
 // stored voucher so the number matches Tally Prime's own Statistics total.
 // hiddenNote: optional extra line explaining vouchers Tally hides from its
@@ -1198,26 +1207,26 @@ async function printSyncSummary(syncStart) {
           `SELECT COALESCE(voucher_type, 'Unknown') AS voucher_type,
                   count(*) FILTER (WHERE NOT is_cancelled)::int AS active,
                   count(*) FILTER (WHERE is_cancelled)::int AS cancelled
-           FROM vouchers WHERE company_guid = ANY($1)
+           FROM vouchers
+          WHERE company_guid = ANY($1)
+            AND COALESCE(payload->'ISOPTIONAL'->>0, 'No') <> 'Yes'
+            AND COALESCE(payload->'ISPOSTDATED'->>0, 'No') <> 'Yes'
            GROUP BY voucher_type ORDER BY active DESC, cancelled DESC`,
           [guids]
         );
-        // Vouchers Tally Prime hides from Day Book/Statistics until confirmed
+        // Unconfirmed draft vouchers excluded above — surface the count so the
+        // numbers reconcile with Tally Prime's on-screen total.
         let hiddenNote = null;
         try {
           const { rows: hidRows } = await pool.query(
-            `SELECT
-               count(*) FILTER (WHERE payload->'ISOPTIONAL'->>0 = 'Yes')::int AS optional_count,
-               count(*) FILTER (WHERE payload->'ISPOSTDATED'->>0 = 'Yes')::int AS postdated_count
-             FROM vouchers WHERE company_guid = ANY($1) AND NOT is_cancelled`,
+            `SELECT count(*)::int AS draft_count
+             FROM vouchers
+            WHERE company_guid = ANY($1)
+              AND (COALESCE(payload->'ISOPTIONAL'->>0, 'No') = 'Yes'
+                   OR COALESCE(payload->'ISPOSTDATED'->>0, 'No') = 'Yes')`,
             [guids]
           );
-          const parts = [];
-          if (hidRows[0]?.optional_count > 0) parts.push(`${hidRows[0].optional_count.toLocaleString()} optional`);
-          if (hidRows[0]?.postdated_count > 0) parts.push(`${hidRows[0].postdated_count.toLocaleString()} post-dated`);
-          if (parts.length) {
-            hiddenNote = `Includes ${parts.join(" and ")} voucher(s). Tally Prime hides these from Day Book/Statistics until they are confirmed, so its on-screen total can be lower.`;
-          }
+          hiddenNote = draftNote(hidRows[0]?.draft_count || 0);
         } catch {}
         const mapped = dbRows.map((r) => ({
           type: r.voucher_type,
@@ -1225,6 +1234,11 @@ async function printSyncSummary(syncStart) {
           cancelled: r.cancelled
         }));
         printVoucherTypeBreakdown(mapped, hiddenNote);
+      } else if (cs.voucherTypeBreakdown && cs.voucherTypeBreakdown.length > 0) {
+        // Fallback: last-known breakdown captured during this cycle.
+        const d = cs.voucherDrafts;
+        const draftCount = d ? d.active + d.cancelled : 0;
+        printVoucherTypeBreakdown(cs.voucherTypeBreakdown, draftNote(draftCount));
       }
     } catch (e) {}
 
@@ -2497,6 +2511,11 @@ async function syncVouchers(company, opts = {}) {
   let skipped = 0;
   let cancelledCount = 0;
   let totalFetched = 0;
+  // Unconfirmed draft vouchers (optional / post-dated). Tally Prime does not
+  // count these in its on-screen voucher totals until they are confirmed, so
+  // the breakdown excludes them too (they are still stored in the DB).
+  let draftVouchers = 0;
+  let draftCancelled = 0;
   const voucherTypeCounts = {};
   const cancelledTypeCounts = {};
   // Deduplicate: Voucher Register XML returns each voucher multiple times
@@ -2535,11 +2554,18 @@ async function syncVouchers(company, opts = {}) {
     const isDeleted = v.ISDELETED ? v.ISDELETED[0] : null;
     const isCancelled = v.ISCANCELLED ? v.ISCANCELLED[0] : null;
     const voucherIsCancelled = isDeleted === "Yes" || isCancelled === "Yes";
+    const isDraft =
+      extractValue(v.ISOPTIONAL?.[0]) === "Yes" ||
+      extractValue(v.ISPOSTDATED?.[0]) === "Yes";
     if (voucherIsCancelled) {
       cancelledCount++;
-      const rawType = extractValue(v.VOUCHERTYPENAME?.[0] || v.VOUCHERTYPE?.[0]);
-      const cTypeKey = (rawType || "").trim() || "Unknown";
-      cancelledTypeCounts[cTypeKey] = (cancelledTypeCounts[cTypeKey] || 0) + 1;
+      if (isDraft) {
+        draftCancelled++;
+      } else {
+        const rawType = extractValue(v.VOUCHERTYPENAME?.[0] || v.VOUCHERTYPE?.[0]);
+        const cTypeKey = (rawType || "").trim() || "Unknown";
+        cancelledTypeCounts[cTypeKey] = (cancelledTypeCounts[cTypeKey] || 0) + 1;
+      }
     }
 
     rows.chunkGuids.push(voucherGuid);
@@ -2549,7 +2575,11 @@ async function syncVouchers(company, opts = {}) {
     const voucherType = extractValue(v.VOUCHERTYPENAME?.[0] || v.VOUCHERTYPE?.[0]);
     const vTypeKey = (voucherType || "").trim() || "Unknown";
     if (!voucherIsCancelled) {
-      voucherTypeCounts[vTypeKey] = (voucherTypeCounts[vTypeKey] || 0) + 1;
+      if (isDraft) {
+        draftVouchers++;
+      } else {
+        voucherTypeCounts[vTypeKey] = (voucherTypeCounts[vTypeKey] || 0) + 1;
+      }
     }
     const referenceNo =
       extractValue(v.REFERENCE?.[0] || v.REFERENCENUMBER?.[0] || v.VOUCHERNUMBER?.[0]);
@@ -2907,7 +2937,7 @@ async function syncVouchers(company, opts = {}) {
   typeArr.sort((a, b) => b.total - a.total);
 
   if (allTypes.size > 0 && isDeveloperMode) {
-    printVoucherTypeBreakdown(typeArr);
+    printVoucherTypeBreakdown(typeArr, draftNote(draftVouchers + draftCancelled));
     console.log("");
   }
 
@@ -2915,6 +2945,11 @@ async function syncVouchers(company, opts = {}) {
   if (typeArr.length > 0) {
     SYNC_SUMMARY.voucherTypeBreakdown = typeArr;
     if (CURRENT_COMPANY_STATS) CURRENT_COMPANY_STATS.voucherTypeBreakdown = typeArr;
+  }
+  if (draftVouchers + draftCancelled > 0) {
+    const draftInfo = { active: draftVouchers, cancelled: draftCancelled };
+    SYNC_SUMMARY.voucherDrafts = draftInfo;
+    if (CURRENT_COMPANY_STATS) CURRENT_COMPANY_STATS.voucherDrafts = draftInfo;
   }
   if (saveVouchers) await logSync("vouchers", stats.voucherSaved);
   if (saveInvoices) await logSync("invoices", stats.invoiceSaved);
