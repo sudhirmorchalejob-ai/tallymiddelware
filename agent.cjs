@@ -1091,7 +1091,7 @@ function entityLabel(entityKey) {
 // reconciled with what the user sees in Tally.
 function draftNote(count) {
   if (!count || count <= 0) return null;
-  return `Excluded ${count.toLocaleString()} unconfirmed draft voucher(s) (optional/post-dated). Tally Prime also does not count these until confirmed. They are still stored in the database.`;
+  return `Excluded ${count.toLocaleString()} unconfirmed draft voucher(s) (optional/post-dated). Tally Prime also does not count these until confirmed.`;
 }
 
 // rows: [{ type, active, cancelled, total? }] — TOTAL always includes every
@@ -1109,7 +1109,7 @@ function printVoucherTypeBreakdown(rows, hiddenNote) {
     gA += r.active;
     gC += r.cancelled;
   }
-  console.log(`  ── TOTAL: ${gA.toLocaleString()} / ${gC.toLocaleString()} / ${(gA + gC).toLocaleString()}`);
+  console.log(`  ── TOTAL: ${(gA + gC).toLocaleString()} (${gC.toLocaleString()} cancelled)`);
   if (hiddenNote) console.log(`  ℹ️ ${hiddenNote}`);
 }
 
